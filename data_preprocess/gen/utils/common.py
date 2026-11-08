@@ -4,6 +4,7 @@ Common utility functions
 
 import json
 import hashlib
+from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Set, Optional, Union, Tuple, List
 
@@ -130,6 +131,12 @@ def save_sample_data(
         data_dir.mkdir(parents=True, exist_ok=True)
         json_dir.mkdir(parents=True, exist_ok=True)
 
+        # Match against the original full paths, never against filenames or
+        # destinations written by an earlier iteration. Keep all occurrences:
+        # an interleaved document can legitimately reuse the same source image.
+        original_inputs = list(json_data.get('input_images', []))
+        original_output = json_data.get('output_image')
+        path_destinations = defaultdict(list)
         if image_files:
             import shutil
             for filename, source in image_files.items():
@@ -145,13 +152,7 @@ def save_sample_data(
                         except (OSError, ValueError):
                             if str(source) != str(dest_path):
                                 shutil.copy2(source, dest_path)
-                        if 'input_images' in json_data and isinstance(json_data['input_images'], list):
-                            for i, img_path in enumerate(json_data['input_images']):
-                                if str(source) == str(img_path) or source.name in str(img_path):
-                                    json_data['input_images'][i] = str(dest_path)
-                        if 'output_image' in json_data:
-                            if str(source) == str(json_data['output_image']) or source.name in str(json_data['output_image']):
-                                json_data['output_image'] = str(dest_path)
+                        path_destinations[str(source.resolve())].append(str(dest_path))
                 else:
                     try:
                         if hasattr(source, 'save'):
@@ -166,6 +167,29 @@ def save_sample_data(
                                 raise ValueError(f"Cannot save image file {filename}, unsupported type: {type(source)}")
                     except Exception as e:
                         print(f"Warning: failed to save image file {filename}: {e}")
+
+        if path_destinations:
+            occurrences = defaultdict(int)
+            mapped_inputs = []
+            for original in original_inputs:
+                key = str(Path(original).resolve())
+                destinations = path_destinations.get(key)
+                if destinations:
+                    # The destination order follows image_files, as supplied by
+                    # the sequence builder. Reuse one destination if only one
+                    # physical copy was requested for repeated references.
+                    position = min(occurrences[key], len(destinations) - 1)
+                    mapped_inputs.append(destinations[position])
+                    occurrences[key] += 1
+                else:
+                    mapped_inputs.append(original)
+            if 'input_images' in json_data:
+                json_data['input_images'] = mapped_inputs
+            if original_output:
+                destinations = path_destinations.get(str(Path(original_output).resolve()))
+                if destinations:
+                    # Callers append the target after the reference images.
+                    json_data['output_image'] = destinations[-1]
 
         if isinstance(unique_id, tuple):
             md5_hash, original_string = unique_id
@@ -225,11 +249,23 @@ def generate_unique_id(task: str, return_original: bool = False, **kwargs) -> Un
         original_id = f"spatial_{sub_type}_{source}_{view_config}"
 
     elif task == "temporal":
-        video_path = kwargs.get('video_path', 'unknown')
-        frame_indices = kwargs.get('frame_indices', [])
-        video_name = Path(video_path).stem if video_path != 'unknown' else 'unknown'
-        frames_str = "_".join([str(i) for i in sorted(frame_indices)]) if frame_indices else "unknown"
-        original_id = f"temporal_{video_name}_{frames_str}"
+        # process_sample passes the source manifest, its row, and clip index.
+        # Preserve the published ID convention so resume/dedup stays compatible.
+        yt_file = kwargs.get('yt_file')
+        yt_line = kwargs.get('yt_line')
+        part_idx = kwargs.get('part_idx')
+        if yt_file and yt_line is not None and part_idx is not None:
+            yt_line, part_idx = int(yt_line), int(part_idx)
+            if yt_line < 0 or part_idx < 0:
+                raise ValueError('Temporal source row and clip index must be nonnegative')
+            original_id = f"temporal_{Path(yt_file).stem}_{yt_line:08d}_{part_idx:04d}"
+        elif kwargs.get('video_path') and kwargs.get('frame_indices'):
+            # Retain support for callers identifying a clip by video + frames.
+            video_name = Path(kwargs['video_path']).stem
+            frames_str = "_".join(str(i) for i in sorted(kwargs['frame_indices']))
+            original_id = f"temporal_{video_name}_{frames_str}"
+        else:
+            raise ValueError('Temporal IDs require yt_file/yt_line/part_idx or video_path/frame_indices')
     else:
         original_id = f"{task}_{hashlib.md5(str(kwargs).encode()).hexdigest()[:8]}"
 
